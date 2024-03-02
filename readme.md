@@ -4,6 +4,10 @@ Designed with 2 different options in mind:
 - Interception: Intercept/Modify packets sent from/to the official game client.
 - Emulation: Imitate the official game client.
 
+
+https://github.com/LeftMouseButton/L2C_Public/assets/144728977/acf5da9d-9b2c-4cd1-a3b2-733bfd61b8e5
+
+
 Completed:
 - Login & Gameplay via Interception
 - Crypt
