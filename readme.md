@@ -8,17 +8,27 @@ Designed with 2 different options in mind:
 https://github.com/LeftMouseButton/L2C_Public/assets/144728977/acf5da9d-9b2c-4cd1-a3b2-733bfd61b8e5
 
 
+https://github.com/LeftMouseButton/L2C_Public/assets/144728977/2b7e25f1-abfe-4427-b51e-9a8e9b2d90d7
+
+
+
 Completed:
 - Login & Gameplay via Interception
+- Login (Auth+GameServer) via Emulation
 - Crypt
 - - Blowfish
 - - XOR
+- - RSA
 - Platform:
 - - Linux
 
 Todo:
-- Login via Emulation
 - Clean up code structure
+- Packets: A few hundred, for each version of the game
+- Game Data
+- UI, GUI
+- Scripting: LUA
+- Platform: Windows
 - ...
 
 
