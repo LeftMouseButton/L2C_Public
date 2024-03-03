@@ -76,6 +76,8 @@ Todo:
 					1x int32, hardcoded, incremented by the amount of bytes processed by each encrypt/decrypt operation
 					1x int32, hardcoded
 			Contains an obfuscation key (if not 0, client will shuffle its packet opcodes)
+		Client sends RequestPlayerList packet
+			Contains the session keys from auth PlayOK and auth LoginOK
 		...
 
 	Game Server (gameplay section):

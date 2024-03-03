@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include "blowfish.h"
 #include "xor_crypt.h"
+#include "checksum.h"
+#include "rsa.h"
 
 enum enumBotType
 {
@@ -21,6 +23,7 @@ enum enumError
 };
 pthread_t interceptionThread_Server = 0;
 pthread_t interceptionThread_Client = 0;
+pthread_t emulationThread_Server = 0;
 unsigned short clientToBotAuthPort = 2106;
 unsigned short clientToBotGamePort = 7777;
 int clientSocket_Auth = -1;
@@ -66,6 +69,10 @@ enum enumLoginState
 	LOGIN_GAME = 1
 };
 enum enumLoginState LoginState;
+char username[14] = "username\0\0\0\0\0\0";
+char password[16] = "pass\0\0\0\0\0\0\0\0\0\0\0\0";
+unsigned long long SessionKey_LoginOK;
+unsigned long long SessionKey_PlayOK;
 
 //Wrapper for easy redirect/disable later
 void Log(char* text, ...)
@@ -334,13 +341,16 @@ void Server_ServerList_CT2_6(unsigned char* packet, unsigned short packetLength)
 {
 	//todo: support for multiple servers. Currently selecting the first server.
 
-	//change gameserver IP/port before sending to the client
-	struct in_addr ip;
-	if (!inet_aton(gameServerIPForVM, &ip))
-		Error(NETWORK_FATAL, "Invalid IP address for gameServerIPForVM");
-	else
-		*(unsigned int*)(packet+6) = ip.s_addr;
-	*(unsigned int*)(packet+10) = clientToBotGamePort;
+	if (BotType == Interception)
+	{
+		//change gameserver IP/port before sending to the client
+		struct in_addr ip;
+		if (!inet_aton(gameServerIPForVM, &ip))
+			Error(NETWORK_FATAL, "Invalid IP address for gameServerIPForVM");
+		else
+			*(unsigned int*)(packet+6) = ip.s_addr;
+		*(unsigned int*)(packet+10) = clientToBotGamePort;
+	}
 }
 
 void Server_ServerList(unsigned char* packet, unsigned short packetLength)
@@ -352,6 +362,306 @@ void Server_ServerList(unsigned char* packet, unsigned short packetLength)
 			break;
 		default:
 			Server_ServerList_CT2_6(packet, packetLength);
+	}
+}
+
+/* RequestGGAuth Packet
+2A 00														//packet length
+07 															//packet type
+38 0B BC 75 												//session key
+23 92 90 4D 18 30 B5 7C 96 61 41 47 05 07 96 FB 00 00 00 	//gameguard magic[19], changes based on game version
+FF 90 CF 4E 												//checksum
+00 00 00 00 00 00 00 00 00 00 00 00 						//padding
+*/
+void Client_RequestGGAuth_CT2_6()
+{
+	unsigned char packet[42];
+	unsigned char gameguardAuth_magic_CT2_6[19] = {0x23, 0x01, 0x00, 0x00, 0x67, 0x45, 0x00, 0x00, 0xAB, 0x89, 0x00, 0x00, 0xEF, 0xCD, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0x07;
+	*(unsigned int*)(packet+3) = SessionKey_Init;
+	memcpy(packet+7, gameguardAuth_magic_CT2_6, 19);
+	*(unsigned int*)(packet+26) = Checksum(packet, 2, 24);
+	memset(packet+30, 0, 12);
+	Blowfish_Encipher(packet+2, sizeof(packet)-2);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+void Client_RequestGGAuth()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestGGAuth_CT2_6();
+			break;
+		default:
+			Client_RequestGGAuth_CT2_6();
+	}
+}
+
+/* RequestAuthLogin Packet
+	pre-RSA
+B2 00 															//packet length
+00 																//packet type
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 	//nothing
+24 																//unknown
+00 00 															//nothing
+75 73 65 72 6E 61 6D 65 00 00 00 00 00 00 						//username (not sure if null-terminated, padded, etc)
+70 61 73 73 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 	//pass (not sure if null-terminated, padded, etc)
+00 00 00 00 													//session key goes here
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 				//gameguard query goes here
+08 																//unknown
+00 00 00 00 00 00 00 00 00 00									//nothing
+00 00 00 00 													//checksum goes here
+00 00 00 00 00 00 00 00 00 00 00 00  							//padding
+*/
+/* 	post-RSA, post-checksum, pre-blowfish
+B2 00 															//packet length
+00 																//packet type
+8E 9C D4 19 3F 1F 80 4B 5D 1A 79 78 F9 EC FD EB 86 1A 71 FD 83 52 58 BD 52 00 54 18 9A 39 08 7A F9 56 DA 7F 30 2C 69 4A 13 EA A2 BE D8 D1 15 D4 3B 2C C3 F7 D8 6B 50 7A 51 D1 E0 90 D6 AE C5 C8 5C 4B 85 F2 9C 3B 2C 0F 4C FF 78 9E 13 36 0A 7E EA AE E3 C3 BB FA 77 43 2D 38 DE 	//nothing
+99 																//unknown
+B6 FC 															//nothing
+8B 0E 92 47 28 B0 7B AA C0 4E 5A 2E 58 28 						//user
+02 D5 40 8C E3 40 FE BF 27 05 B0 B4 99 08 D7 B8 DF D6 AD 19 	//pass
+F4 3F C5 98 													//session key
+23 01 00 00 67 45 00 00 AB 89 00 00 EF CD 00 00 				//gameguard query
+08 																//unknown
+00 00 00 00 00 00 00 00 00 00 									//nothing
+0B 24 E6 0C 													//checksum
+00 00 00 00 00 00 00 00 00 00 00 00 							//padding
+*/
+/* RequestAuthLogin Packet, CT2.6 HighFive Client (though the title screen says Freya), post-RSA, post-checksum, pre-blowfish
+C2 00 
+00 																						//packet type
+76 22 52 E4 FB 93 B0 69 42 38 80 03 4A 18 99 48 F3 4E 44 3C 							//padding start
+14 41 C4 97 D5 50 DA 33 B1 C4 E5 A5 63 15 A2 51 B3 84 8C 5E 
+26 77 37 E3 FA 4C 47 34 80 AF DC F0 DC 6A EF 78 E7 D1 BF C9 
+0E FF D1 FB E7 A6 AF 9C A3 41 36 F7 F3 A2 44 AB 49 49 24 D7 
+6C 3C 3F 01 5C 24 46 CB 98 47 88 														//padding end
+38 																						//?
+4A C9 																					//?
+A5 42 79 D8 A7 99 99 F3 1D 86 2A 2B 1C 1F 												//username
+98 7F 41 CD 7D FB DA D3 01 72 1D B7 5E 43 02 49 B1 D8 9A 4F 							//password
+83 A1 7B 7A 																			//session key
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 										//gameguard query
+08 																						//?
+00 00 00 00 00 00 DB 37 0B 78 															//?
+7E 1F 9E 24 																			//checksum
+7D 42 29 AC FE 4D 4B F1 00 00 00 00 CD CE EA 28 00 00 00 00 00 00 00 00 00 00 00 00 	//?
+*/
+void Client_RequestAuthLogin_CT2_6()
+{
+	unsigned char packet[178];
+	unsigned char ggqueryreply[16] = {0x23, 0x01, 0x00, 0x00, 0x67, 0x45, 0x00, 0x00, 0xAB, 0x89, 0x00, 0x00, 0xEF, 0xCD, 0x00, 0x00}; //default: reply to blank gameguard query
+
+	memset(packet, 0, sizeof(packet));
+	*(unsigned short*)packet = sizeof(packet);
+	//packet type is (already) 0
+	packet[94] = 0x24; //unknown
+	memcpy(packet+97,username, sizeof(username));
+	memcpy(packet+111,password, sizeof(password));
+	RSA_Encrypt(packet+3, rsaKey, 65537); //todo: implement own version of bignum to remove dependency on gmp library
+
+	*(unsigned int*)(packet+131) = SessionKey_Init;
+
+	//gameguard query... clients with GG removed send 0x00's, clients with GG use GGAuth packet values to send a queryreply. sending a known reply for now.
+	memcpy(packet+135, ggqueryreply, 16);
+	packet[151] = 0x08; //unknown
+
+	*(unsigned int*)(packet+162) = Checksum(packet, 2, 160);
+	Blowfish_Encipher(packet+2, sizeof(packet)-2);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+void Client_RequestAuthLogin()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestAuthLogin_CT2_6();
+			break;
+		default:
+			Client_RequestAuthLogin_CT2_6();
+	}
+}
+
+/*	LoginOK Packet
+3A 00 
+03 
+FE 50 C2 F8 10 59 19 37 		//session key
+00 00 00 00 00 00 00 00 EA 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 56 67 C8 CC 52 6D 13
+*/
+void Server_LoginOK_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	SessionKey_LoginOK = *(unsigned long long*)(packet+3);
+}
+
+void Server_LoginOK(unsigned char* packet, unsigned short packetLength)
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Server_LoginOK_CT2_6(packet, packetLength);
+			break;
+		default:
+			Server_LoginOK_CT2_6(packet, packetLength);
+	}
+}
+
+/* RequestServerList packet
+22 00 
+05 										//packet type
+FE 50 C2 F8 10 59 19 37 				//sessionkey (from loginok)
+05 										//?
+00 00 00 00 00 00 						//padding
+CA EB 09 DB 							//checksum
+00 00 00 00 00 00 00 00 00 00 00 00 	//padding
+*/
+void Client_RequestServerList_CT2_6()
+{
+	unsigned char packet[34];
+
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0x05;
+	*(unsigned long long*)(packet+3) = SessionKey_LoginOK;
+	packet[11] = 0x04;								//unknown
+
+	memset(packet+12, 0, sizeof(packet)-12);						//padding
+	*(unsigned int*)(packet+18) = Checksum(packet, 2, 16);
+	Blowfish_Encipher(packet+2, sizeof(packet)-2);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestServerList()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestServerList_CT2_6();
+			break;
+		default:
+			Client_RequestServerList_CT2_6();
+	}
+}
+
+/* RequestServerLogin packet
+22 00 
+02 										//packet type
+FE 50 C2 F8 10 59 19 37 				//sessionkey (loginok)
+01 										//desired server #
+00 00 00 00 00 00 						//padding
+CD EF 09 DB 							//checksum
+00 00 00 00 00 00 00 00 00 00 00 00		//padding
+*/
+void Client_RequestServerLogin_CT2_6()
+{
+	unsigned char packet[34];
+
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0x02;
+	*(unsigned long long*)(packet+3) = SessionKey_LoginOK;
+	packet[11] = 0x01;								//todo: server selection. currently just selecting server #1.
+
+	memset(packet+12, 0, sizeof(packet)-12);						//padding
+	*(unsigned int*)(packet+18) = Checksum(packet, 2, 16);
+	Blowfish_Encipher(packet+2, sizeof(packet)-2);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestServerLogin()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestServerLogin_CT2_6();
+			break;
+		default:
+			Client_RequestServerLogin_CT2_6();
+	}
+}
+
+/* PlayOK Packet
+12 00 
+07 								//packet type
+8C 87 BD FE 80 1A 47 DB 		//sessionkey playok
+06 8A 15 22 0A 17 EF 			//?
+*/
+void Server_PlayOK_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	SessionKey_PlayOK = *(unsigned long long*)(packet+3);
+}
+
+void Server_PlayOK(unsigned char* packet, unsigned short packetLength)
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Server_PlayOK_CT2_6(packet, packetLength);
+			break;
+		default:
+			Server_PlayOK_CT2_6(packet, packetLength);
+	}
+}
+
+/* ProtocolVersion packet
+0B 01 
+0E 						//packet type
+11 01 00 00 			//protocol
+09 07 54 56 03 09 0B 01 07 02 54 54 56 07 00 02 //magic
+55 56 00 51 00 53 57 04 07 55 08 54 01 07 01 53 
+00 56 55 56 01 06 05 04 51 03 08 51 08 51 56 04 
+54 06 55 08 02 09 51 56 01 53 06 55 04 53 00 56 
+56 53 01 09 02 09 01 51 54 51 09 55 56 09 03 04 
+07 05 55 04 06 55 04 06 09 04 51 01 08 08 06 05 
+52 06 04 01 07 54 03 06 52 55 06 55 55 51 01 02 
+04 54 03 55 54 01 57 51 55 05 52 05 54 07 51 51 
+55 07 02 53 53 00 52 05 52 07 01 54 00 03 05 05 
+08 06 05 05 06 03 00 0D 08 01 07 09 03 51 03 07 
+53 09 51 06 07 54 0A 50 56 02 52 04 05 55 51 02 
+53 00 08 54 04 52 56 06 02 09 00 08 03 53 56 01 
+05 00 55 06 08 56 04 0D 06 07 52 06 07 04 0A 06 
+01 04 54 04 00 05 02 04 54 00 09 52 53 05 04 01 
+04 05 05 01 52 51 52 0D 06 51 08 09 54 53 00 0D 
+01 02 03 54 53 01 05 03 08 56 54 07 02 54 0B 06 //end magic
+A6 23 F4 FE 		//magic 2
+*/
+void Client_ProtocolVersion_CT2_6(int protocol)
+{
+	//todo: allow changing protocols
+	unsigned char protocol_magic[] = {0x09, 0x07, 0x54, 0x56, 0x03, 0x09, 0x0B, 0x01, 0x07, 0x02, 0x54, 0x54, 0x56, 0x07, 
+	0x00, 0x02, 0x55, 0x56, 0x00, 0x51, 0x00, 0x53, 0x57, 0x04, 0x07, 0x55, 0x08, 0x54, 0x01, 0x07, 0x01, 0x53, 0x00, 0x56, 
+	0x55, 0x56, 0x01, 0x06, 0x05, 0x04, 0x51, 0x03, 0x08, 0x51, 0x08, 0x51, 0x56, 0x04, 0x54, 0x06, 0x55, 0x08, 0x02, 0x09, 
+	0x51, 0x56, 0x01, 0x53, 0x06, 0x55, 0x04, 0x53, 0x00, 0x56, 0x56, 0x53, 0x01, 0x09, 0x02, 0x09, 0x01, 0x51, 0x54, 0x51, 
+	0x09, 0x55, 0x56, 0x09, 0x03, 0x04, 0x07, 0x05, 0x55, 0x04, 0x06, 0x55, 0x04, 0x06, 0x09, 0x04, 0x51, 0x01, 0x08, 0x08, 
+	0x06, 0x05, 0x52, 0x06, 0x04, 0x01, 0x07, 0x54, 0x03, 0x06, 0x52, 0x55, 0x06, 0x55, 0x55, 0x51, 0x01, 0x02, 0x04, 0x54, 
+	0x03, 0x55, 0x54, 0x01, 0x57, 0x51, 0x55, 0x05, 0x52, 0x05, 0x54, 0x07, 0x51, 0x51, 0x55, 0x07, 0x02, 0x53, 0x53, 0x00, 
+	0x52, 0x05, 0x52, 0x07, 0x01, 0x54, 0x00, 0x03, 0x05, 0x05, 0x08, 0x06, 0x05, 0x05, 0x06, 0x03, 0x00, 0x0D, 0x08, 0x01, 
+	0x07, 0x09, 0x03, 0x51, 0x03, 0x07, 0x53, 0x09, 0x51, 0x06, 0x07, 0x54, 0x0A, 0x50, 0x56, 0x02, 0x52, 0x04, 0x05, 0x55, 
+	0x51, 0x02, 0x53, 0x00, 0x08, 0x54, 0x04, 0x52, 0x56, 0x06, 0x02, 0x09, 0x00, 0x08, 0x03, 0x53, 0x56, 0x01, 0x05, 0x00, 
+	0x55, 0x06, 0x08, 0x56, 0x04, 0x0D, 0x06, 0x07, 0x52, 0x06, 0x07, 0x04, 0x0A, 0x06, 0x01, 0x04, 0x54, 0x04, 0x00, 0x05, 
+	0x02, 0x04, 0x54, 0x00, 0x09, 0x52, 0x53, 0x05, 0x04, 0x01, 0x04, 0x05, 0x05, 0x01, 0x52, 0x51, 0x52, 0x0D, 0x06, 0x51, 
+	0x08, 0x09, 0x54, 0x53, 0x00, 0x0D, 0x01, 0x02, 0x03, 0x54, 0x53, 0x01, 0x05, 0x03, 0x08, 0x56, 0x54, 0x07, 0x02, 0x54, 0x0B, 0x06};
+	unsigned char protocol_magic_2[4] = {0xA6, 0x23, 0xF4, 0xFE}; //protocol_ct2_4_to_ct3_0
+
+	unsigned char packet[267];
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0x0E;
+	*(unsigned int*)(packet+3) = protocol;
+	memcpy(packet+7, protocol_magic, sizeof(protocol_magic));
+	memcpy(packet+7+sizeof(protocol_magic), protocol_magic_2, sizeof(protocol_magic_2));
+
+	//no blowfish/checksum/padding/etc for this packet...
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_ProtocolVersion(int protocol)
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_ProtocolVersion_CT2_6(protocol);
+			break;
+		default:
+			Client_ProtocolVersion_CT2_6(protocol);
 	}
 }
 
@@ -385,19 +695,32 @@ int HandleServerPacket_AuthLogin(unsigned char* packet, unsigned short packetLen
 		case INIT:
 			Log("INIT packet received");
 			Server_Init(packet, packetLength);
+			if (BotType == Emulation)
+				Client_RequestGGAuth();
 			break;
 		case GGAUTH:	//22 00 0B 83 A1 7B 7A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 B7 1B BF 1B 8E C3 6A 6A BA 79 AE 
 			Log("GGAuth packet received");
+			if (BotType == Emulation)
+				Client_RequestAuthLogin();
 			break;
 		case LOGINOK:
 			Log("LoginOK packet received"); 
+			if (BotType == Emulation)
+			{
+				Server_LoginOK(packet, packetLength);
+				Client_RequestServerList();
+			}
 			break;
 		case SERVERLIST:
 			Log("SERVERLIST packet received");
 			Server_ServerList(packet, packetLength);
+			if (BotType == Emulation)
+				Client_RequestServerLogin();
 			break;
 		case PLAYOK:
 			Log("PLAYOK packet received");
+			if (BotType == Emulation)
+				Server_PlayOK(packet, packetLength);
 			LoginState = LOGIN_GAME;
 			Log("Disconnecting from AuthServer");
 			close(serverSocket);
@@ -410,6 +733,8 @@ int HandleServerPacket_AuthLogin(unsigned char* packet, unsigned short packetLen
 					Blowfish_Encipher(packet+2, packetLength-2);
 					SendToSocket(clientSocket_Auth, packet, packetLength);
 				}
+				else if (BotType == Emulation)
+					Client_ProtocolVersion(273);		//todo: allow changing protocol in settings/etc
 				return 1;
 			}
 			else
@@ -420,6 +745,55 @@ int HandleServerPacket_AuthLogin(unsigned char* packet, unsigned short packetLen
 	}
 
 	return 0;
+}
+
+void WriteString_CharToUTF16(char* value, unsigned char* packet, int* indexVariable)
+{
+	for (int i = 0; i <= strlen(value); i++, *indexVariable+=2)	//intentionally reading the null byte at the end of source string, terminating UTF16 string with 3x null bytes
+		*((uint16_t*)(packet+*indexVariable)) = value[i];
+}
+
+/* RequestPlayerList packet
+35 00 
+2B 															//packet type
+75 00 73 00 65 00 72 00 6E 00 61 00 6D 00 65 00 00 00 		//username in null-terminated UTF16 (can be longer/shorter)
+09 B8 69 51 9F A4 DB 2C 									//SessionKey_PlayOK		--strangely, this is bytes [4],[5],[6],[7], then [0],[1],[2],[3]
+ED 09 F2 76 94 BC 93 A1 									//SessionKey_LoginOK	-- bytes [0][1][2][3][4][5][6][7]
+01 00 00 00 												//?
+67 01 00 00 00 00 00 00 00 00 00 00 						//?
+*/
+void Client_RequestPlayerList_CT2_6()
+{
+	unsigned char moreMagicValues[8] = {0x67, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+	unsigned char packet[0x80];	//todo: confirm this buffer size is appropriate
+	//packet length set later
+	packet[2] = 0x2B;
+	int index = 3;
+	WriteString_CharToUTF16(username, packet, &index);						//username in null-terminated UTF16 (can be longer/shorter)
+	//todo: better way of handing packets with variable sizes (changing all the +'s for other versions could get out of hand)
+	*(unsigned int*)(packet+index) = SessionKey_PlayOK >> 32;				//SessionKey_PlayOK	bytes [4],[5],[6],[7]
+	*(unsigned int*)(packet+index+4) = *(unsigned int*)&SessionKey_PlayOK;	//SessionKey_PlayOK	bytes [0],[1],[2],[3]
+	*(unsigned long long*)(packet+index+8) = SessionKey_LoginOK;
+	*(unsigned int*)(packet+index+16) = 1;
+	memcpy(packet+index+20, moreMagicValues, sizeof(moreMagicValues));
+
+	//set packet length, encrypt, send
+	*(unsigned short*)packet = index+20+sizeof(moreMagicValues);
+	GamePacket_Encrypt(packet, index+20+sizeof(moreMagicValues), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, index+20+sizeof(moreMagicValues));
+}
+
+void Client_RequestPlayerList()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestPlayerList_CT2_6();
+			break;
+		default:
+			Client_RequestPlayerList_CT2_6();
+	}
 }
 
 /* VersionCheck Packet -- unencrypted packet
@@ -440,15 +814,371 @@ void Server_VersionCheck_CT2_6(unsigned char* packet, unsigned short packetLengt
 	unsigned char gameKey_staticPart[8] = {0xC8, 0x27, 0x93, 0x01, 0xA1, 0x6C, 0x31, 0x97};
 	memcpy(gameKey_Encryption_Server, packet+4, 8);
 	memcpy(gameKey_Encryption_Server+8, gameKey_staticPart, 8);
-
 	memcpy(gameKey_Encryption_Client, packet+4, 8);
 	memcpy(gameKey_Encryption_Client+8, gameKey_staticPart, 8);
-
 	memcpy(gameKey_Decryption_Server, packet+4, 8);
 	memcpy(gameKey_Decryption_Server+8, gameKey_staticPart, 8);
-
 	memcpy(gameKey_Decryption_Client, packet+4, 8);
 	memcpy(gameKey_Decryption_Client+8, gameKey_staticPart, 8);
+
+	if (BotType == Emulation)
+		Client_RequestPlayerList();
+}
+
+/* CharacterSelect packet
+15 00 
+12 											//packet type
+02 00 00 00 								//character to select (starting at 0)
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 	//padding
+*/
+void Client_CharacterSelect_CT2_6()
+{
+	//todo: character selecting. just choosing the first character for now.
+
+	unsigned char packet[21] = {0x15, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_CharacterSelect()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_CharacterSelect_CT2_6();
+			break;
+		default:
+			Client_CharacterSelect_CT2_6();
+	}
+}
+
+/* CharacterSelectionInfo packet
+-- 3 chars:
+47 04 
+09 					//packet type
+03 00 00 00 		//char count
+07 00 00 00 		//?
+00 					//?
+41 00 63 00 63 00 6F 00 75 00 6E 00 74 00 32 00 43 00 68 00 61 00 72 00 31 00 00 00 	//character name in null-terminated UTF16 (can be longer/shorter)
+97 4B 01 10 		//char id
+75 00 73 00 65 00 72 00 6E 00 61 00 6D 00 65 00 32 00 00 00 							//login username in null-terminated UTF16 (can be longer/shorter)
+07 C4 D7 1D 		//session id
+00 00 00 00 		//clan id
+00 00 00 00 		//?
+01 00 00 00 		//sex (1 = female)
+01 00 00 00 		//race (1 = elf)
+19 00 00 00 		//class (0x12 = elf fighter, 0x19 = elf mystic)
+01 00 00 00 		//active
+06 B3 00 00 		//x
+14 A1 00 00 		//y
+4B F2 FF FF 		//z
+00 00 00 00 00 00 58 40 	//hp (double)
+00 00 00 00 00 00 56 40 	//mp (double)
+00 00 00 00 00 00 00 00 	//xp (uint64)
+00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00 00 00 00 A9 01 00 00 CD 01 00 00 00 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 58 40 00 00 00 00 00 00 56 40 00 00 00 00 19 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20 4E 00 00 		//unknown[245]
+41 00 63 00 63 00 6F 00 75 00 6E 00 74 00 32 00 43 00 68 00 61 00 72 00 32 00 00 00 	//character name in null-terminated UTF16 (can be longer/shorter)
+BF 4B 01 10 		//char id
+75 00 73 00 65 00 72 00 6E 00 61 00 6D 00 65 00 32 00 00 00 							//login username in null-terminated UTF16 (can be longer/shorter)
+07 C4 D7 1D 		//session id
+00 00 00 00 		//clan id
+00 00 00 00 		//?
+01 00 00 00 		//sex
+01 00 00 00 		//race
+12 00 00 00 		//class
+01 00 00 00 		//active
+23 B4 00 00 		//x
+B5 A0 00 00 		//y
+90 F2 FF FF 		//z
+00 00 00 00 00 40 5C 40 //hp
+00 00 00 00 00 80 43 40 //mp
+00 00 00 00 00 00 00 00 //xp
+00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 41 09 00 00 00 00 00 00 00 00 00 00 7A 04 00 00 7B 04 00 00 00 00 00 00 00 00 00 00 41 09 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00 00 00 00 00 40 5C 40 00 00 00 00 00 80 43 40 00 00 00 00 12 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20 4E 00 00 		//unknown[245]
+41 00 63 00 63 00 6F 00 75 00 6E 00 74 00 32 00 43 00 68 00 61 00 72 00 33 00 00 00 	//character name in null-terminated UTF16 (can be longer/shorter)
+50 55 01 10 		//char id
+75 00 73 00 65 00 72 00 6E 00 61 00 6D 00 65 00 32 00 00 00 							//login username in null-terminated UTF16 (can be longer/shorter)
+07 C4 D7 1D 		//session id
+00 00 00 00 		//clan id
+00 00 00 00 		//?
+01 00 00 00 		//sex
+00 00 00 00 		//race (0 = human)
+0A 00 00 00 		//class (0x0A = human fighter)
+01 00 00 00 		//active
+DA 9C FE FF 		//x
+06 C9 03 00 		//y
+0E F2 FF FF 		//z
+00 00 00 00 00 80 58 40 //hp
+00 00 00 00 00 80 4D 40 //mp
+00 00 00 00 00 00 00 00 //xp
+00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00 00 00 00 A9 01 00 00 CD 01 00 00 00 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00 00 80 58 40 00 00 00 00 00 00 56 40 00 00 00 00 0A 00 00 00 01 	//unknown[197]
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20 4E 00 00  //end part: the same, whether 1/2/3 chars
+-- 0 chars:
+0C 00 09 00 00 00 00 07 00 00 00 00
+*/
+void Server_CharacterSelectionInfo_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	//todo: just choosing the first character for now. make it a variable for the user to choose.
+	//todo: handle case: 0 characters
+	if (BotType == Emulation)
+	{
+		if (*(unsigned int*)(packet+3) == 0)
+		{
+			Error(NETWORK_FATAL, "No characters. Crashing for now. Fix me.");
+			return;
+		}
+		Client_CharacterSelect();
+	}
+}
+
+void Client_GGInit()
+{
+	//todo: patched clients don't send this, but we should add this for the sake of completion. skipping for now.
+}
+
+/* RequestManorList EXPacket
+05 00 
+D0 
+01 00 
+*/
+void Client_RequestManorList_CT2_6()
+{
+	unsigned char packet[5] = {0x05, 0x00, 0xD0, 0x01, 0x00};
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestManorList()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestManorList_CT2_6();
+			break;
+		default:
+			Client_RequestManorList_CT2_6();
+	}
+}
+
+/* RequestAllFortressInfo EXPacket
+05 00 
+D0 
+3D 00 
+*/
+void Client_RequestAllFortressInfo_CT2_6()
+{
+	unsigned char packet[5] = {0x05, 0x00, 0xD0, 0x3D, 0x00};
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestAllFortressInfo()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestAllFortressInfo_CT2_6();
+			break;
+		default:
+			Client_RequestAllFortressInfo_CT2_6();
+	}
+}
+
+/* RequestKeyMapping EXPacket
+05 00 
+D0 
+21 00 
+*/
+void Client_RequestKeyMapping_CT2_6()
+{
+	unsigned char packet[5] = {0x05, 0x00, 0xD0, 0x21, 0x00};
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestKeyMapping()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestKeyMapping_CT2_6();
+			break;
+		default:
+			Client_RequestKeyMapping_CT2_6();
+	}
+}
+
+/* EnterWorld packet
+6B 00 
+11 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 //gameguard
+C9 BC F2 A7 66 5A 0B 98 36 A5 BD 89 ED 7F E4 D7 //start of magic[72]
+6B 49 E2 9F EF 76 EB CE A3 FA F4 BF 0C 64 A3 B4 
+A4 CE DC C6 08 3E 6E EA 45 CA D3 FE 88 13 87 B8 
+06 2C 96 F0 9B 1E 8E BC C6 9B 98 C8 63 16 CF D0 
+29 00 00 00 C0 A8 9C 82 						//end of magic[72]
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+*/
+void Client_EnterWorld_CT2_6()
+{
+	unsigned char magic[] = { 0xC9, 0xBC, 0xF2, 0xA7, 0x66, 0x5A, 0x0B, 0x98, 0x36, 0xA5, 0xBD, 0x89, 0xED, 0x7F, 0xE4, 0xD7,
+							0x6B, 0x49, 0xE2, 0x9F, 0xEF, 0x76, 0xEB, 0xCE, 0xA3, 0xFA, 0xF4, 0xBF, 0x0C, 0x64, 0xA3, 0xB4, 
+							0xA4, 0xCE, 0xDC, 0xC6, 0x08, 0x3E, 0x6E, 0xEA, 0x45, 0xCA, 0xD3, 0xFE, 0x88, 0x13, 0x87, 0xB8, 
+							0x06, 0x2C, 0x96, 0xF0, 0x9B, 0x1E, 0x8E, 0xBC, 0xC6, 0x9B, 0x98, 0xC8, 0x63, 0x16, 0xCF, 0xD0, 
+							0x29, 0x00, 0x00, 0x00, 0xC0, 0xA8, 0x9C, 0x82 };
+
+	unsigned char packet[107];
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0x11;
+	memset(packet+3, 0, 16);	//todo: insert gameguard 16 bytes
+	memcpy(packet+19, magic, sizeof(magic));
+	memset(packet+19+sizeof(magic), 0, 16);
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_EnterWorld()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_EnterWorld_CT2_6();
+			break;
+		default:
+			Client_EnterWorld_CT2_6();
+	}
+}
+
+/* RequestSkillCoolTime packet
+03 00 
+A6
+*/
+void Client_RequestSkillCoolTime_CT2_6()
+{
+	unsigned char packet[3] = { 0x03, 0x00, 0xA6 };
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_RequestSkillCoolTime()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_RequestSkillCoolTime_CT2_6();
+			break;
+		default:
+			Client_RequestSkillCoolTime_CT2_6();
+	}
+}
+
+/* CharSelected packet
+EB 00 
+0B 
+54 00 65 00 73 00 74 00 43 00 68 00 61 00 72 00 4E 00 61 00 6D 00 65 00 00 00 		//character name in null-terminated UTF16 (can be longer/shorter)
+F5 C1 01 10 										//id
+00 00 53 A9 FF EA 00 00 00 00 00 00 
+00 00 01 00 00 00 01 00 00 00 19 00 00 00 01 00 
+00 00 85 B8 00 00 44 A1 00 00 4B F2 FF FF 00 00 
+00 00 00 00 58 40 00 00 00 00 00 00 56 40 00 00 
+00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 
+00 00 00 00 00 00 25 00 00 00 15 00 00 00 19 00 
+00 00 28 00 00 00 18 00 00 00 17 00 00 00 11 02 
+00 00 00 00 00 00 19 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+*/
+void Server_CharSelected_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	if (BotType == Emulation)
+	{
+		Client_GGInit();
+		Client_RequestManorList();
+		Client_RequestAllFortressInfo();
+		Client_RequestKeyMapping();
+		sleep(1);
+		Client_EnterWorld();
+		sleep(2);
+		Client_RequestSkillCoolTime();
+		Client_RequestSkillCoolTime(); //intentionally sending this twice.
+	}
+}
+
+void Client_NetPingReply_CT2_6(int id)
+{
+	unsigned char packet[15];
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0xB1;
+	*(unsigned int*)(packet+3) = id;
+	*(unsigned int*)(packet+7) = 10; //todo: supposed to be a random number, from 5-15.
+	*(unsigned int*)(packet+11) = 6144;	// if >= ct2.4 then 6144, else 2048
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_NetPingReply(int id)
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_NetPingReply_CT2_6(id);
+			break;
+		default:
+			Client_NetPingReply_CT2_6(id);
+	}
+}
+
+void Server_NetPing_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	int id = *(unsigned int*)(packet+3);
+	Client_NetPingReply(id);
+}
+
+/* GameGuardReply packet
+14 00 
+CB 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+*/
+void Client_GameGuardReply_CT2_6()
+{
+	//todo: do this properly. just sending a blank reply for now.
+	unsigned char packet[20];
+	*(unsigned short*)packet = sizeof(packet);
+	packet[2] = 0xCB;
+
+	memset(packet+3, 0, sizeof(packet)-3);
+
+	GamePacket_Encrypt(packet, sizeof(packet), gameKey_Encryption_Server);
+	SendToSocket(serverSocket, packet, sizeof(packet));
+}
+
+void Client_GameGuardReply()
+{
+	switch (GameVersion)
+	{
+		case CT2_6_HighFive:
+			Client_GameGuardReply_CT2_6();
+			break;
+		default:
+			Client_GameGuardReply_CT2_6();
+	}
+}
+
+/* GameGuardQuery packet
+13 00 
+74 
+D9 3D 53 27 1D A5 72 2E 8B 03 17 20 A3 1E 5B C3 
+*/
+void Server_GameGuardQuery_CT2_6(unsigned char* packet, unsigned short packetLength)
+{
+	//todo: do this properly. just sending a blank reply for now.
+	Client_GameGuardReply();
 }
 
 /*
@@ -460,7 +1190,7 @@ typedef void (*Handler)(unsigned char* packet, unsigned short packetLength);
 Handler ServerPacket_JumpTable[256];
 void Default_Handler(unsigned char* packet, unsigned short packetLength)
 {
-	
+	Log("Server->Bot: No packet handler for this packet type (0x%02x)\n", packet[2]);
 }
 void Init_ServerPacketJumpTable()
 {
@@ -471,10 +1201,18 @@ void Init_ServerPacketJumpTable()
 	switch (GameVersion)
 	{
 		case CT2_6_HighFive:
+			ServerPacket_JumpTable[0x09] = &Server_CharacterSelectionInfo_CT2_6;
+			ServerPacket_JumpTable[0x0B] = &Server_CharSelected_CT2_6;
 			ServerPacket_JumpTable[0x2E] = &Server_VersionCheck_CT2_6;
+			ServerPacket_JumpTable[0xD9] = &Server_NetPing_CT2_6;
+			ServerPacket_JumpTable[0x74] = &Server_GameGuardQuery_CT2_6;
 			break;
 		default:
+			ServerPacket_JumpTable[0x09] = &Server_CharacterSelectionInfo_CT2_6;
+			ServerPacket_JumpTable[0x0B] = &Server_CharSelected_CT2_6;
 			ServerPacket_JumpTable[0x2E] = &Server_VersionCheck_CT2_6;
+			ServerPacket_JumpTable[0xD9] = &Server_NetPing_CT2_6;
+			ServerPacket_JumpTable[0x74] = &Server_GameGuardQuery_CT2_6;
 	}
 }
 
@@ -676,6 +1414,71 @@ void* InterceptionThread_Client(void* unused)
 	return NULL;
 }
 
+void* EmulationThread_Server(void* unused)
+{
+	int listenSocket;
+	int packetLength;
+	unsigned char* packet = receiveBuffer_Client;
+
+	//Connect to server
+	Log("Connecting to AuthServer");
+	if (ConnectToServer(authServerIP, authServerPort))
+	{
+		Error(NETWORK_FATAL, "Failed to connect to authserver.");
+		return NULL;
+	}
+	Log("Connected to AuthServer");
+
+	Blowfish_Initialize(staticBlowfishKey);
+
+	//Auth Loop: Receive packet from server, handle it
+	while(1)
+	{
+		packetLength = ReceivePacket(serverSocket, packet);
+		if (LoginState == LOGIN_GAME)
+			break;
+		if (packetLength < 3)
+		{
+			Error(NETWORK_FATAL, "EmulationThread_Server() <- ReceivePacket() failed");
+			return NULL;
+		}
+		Blowfish_Decipher(packet+2, packetLength-2);
+		LogHexArray(packet, packetLength, "Server->Bot: ");
+		if (HandleServerPacket_AuthLogin(packet, packetLength))
+			break;
+	}
+
+	//Gameserver now
+	Init_ServerPacketJumpTable();
+
+	//one unencrypted packet
+	packetLength = ReceivePacket(serverSocket, packet);
+	if (packetLength < 3)
+	{
+		Error(NETWORK_FATAL, "EmulationThread_Server() <- ReceivePacket() failed");
+		return NULL;
+	}
+	LogHexArray(packet, packetLength, "Server->Bot: ");
+	ServerPacket_JumpTable[packet[2]](packet, packetLength);
+	
+	//Game Loop: Receive packet from server, handle it
+	while(1)
+	{
+		packetLength = ReceivePacket(serverSocket, packet);
+		if (packetLength < 3)
+		{
+			Error(NETWORK_FATAL, "EmulationThread_Server() <- ReceivePacket() failed");
+			return NULL;
+		}
+		GamePacket_Decrypt(packet, packetLength, gameKey_Decryption_Server);
+		LogHexArray(packet, packetLength, "Server->Bot: ");
+		ServerPacket_JumpTable[packet[2]](packet, packetLength);
+	}
+
+	Error(NETWORK_FATAL, "EmulationThread_Server thread ended unexpectedly...");
+	return NULL;
+}
+
 int main(int argc, char** argv)
 {
 	//todo: let user choose options
@@ -687,6 +1490,11 @@ int main(int argc, char** argv)
 	{
 		if (pthread_create(&interceptionThread_Client, NULL, &InterceptionThread_Client, NULL))
 			Error(NETWORK_FATAL, "Failed to create main Interception thread");
+	}
+	else if (BotType == Emulation)
+	{
+		if (pthread_create(&emulationThread_Server, NULL, &EmulationThread_Server, NULL))
+			Error(NETWORK_FATAL, "Failed to create main Emulation thread");
 	}
 
 	getchar(); //todo: proper event handler for GUI, or LUA interpreter for terminal
